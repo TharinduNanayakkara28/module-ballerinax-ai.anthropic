@@ -19,6 +19,8 @@ import ballerina/test;
 
 const SERVICE_URL = "http://localhost:8080/llm/anthropic";
 const STREAM_TEST_SERVICE_URL = "http://localhost:9090/streamtest/anthropic";
+const STREAM_TEXT_ONLY_SERVICE_URL = "http://localhost:9091/streamtest/anthropic";
+const STREAM_UNREACHABLE_SERVICE_URL = "http://localhost:9999/streamtest/anthropic";
 const API_KEY = "not-a-real-api-key";
 const ERROR_MESSAGE = "Error occurred while attempting to parse the response from the LLM as the expected type. Retrying and/or validating the prompt could fix the response.";
 const RUNTIME_SCHEMA_NOT_SUPPORTED_ERROR_MESSAGE = "Runtime schema generation is not yet supported";
@@ -27,6 +29,8 @@ const STREAM_EDGE_SERVICE_URL = "http://localhost:9092/streamedge";
 
 final ModelProvider claudeProvider = check new (API_KEY, CLAUDE_3_7_SONNET_20250219, SERVICE_URL);
 final ModelProvider streamProvider = check new (API_KEY, CLAUDE_3_7_SONNET_20250219, STREAM_TEST_SERVICE_URL);
+final ModelProvider textOnlyStreamProvider = check new (API_KEY, CLAUDE_3_7_SONNET_20250219, STREAM_TEXT_ONLY_SERVICE_URL);
+final ModelProvider unreachableStreamProvider = check new (API_KEY, CLAUDE_3_7_SONNET_20250219, STREAM_UNREACHABLE_SERVICE_URL);
 final ModelProvider errorEventProvider =
     check new (API_KEY, CLAUDE_SONNET_4_5, STREAM_EDGE_SERVICE_URL + "/errorevent");
 final ModelProvider truncatedProvider =
@@ -399,58 +403,53 @@ function testGenerateMethodWithArrayUnionRecord2() returns ai:Error? {
 }
 
 @test:Config
-function testChatStream() returns error? {
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result = streamProvider->chatStream([
+function testChatAsStream() returns error? {
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error result = streamProvider->chatAsStream([
         {role: ai:USER, content: "Say hello"}
     ]);
     test:assertFalse(result is ai:Error, "Expected a stream, got an error");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check result;
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check result;
 
     string content = "";
     string toolId = "";
     string toolName = "";
     string toolArgs = "";
     ai:FinishReason? finishReason = ();
-    ai:CompletionTokenUsage? usage = ();
-    check from ai:ChatCompletionChunk chunk in chunkStream
+    int chunkCount = 0;
+    check from ai:ChatMessageChunk chunk in chunkStream
         do {
-            if chunk.choices.length() > 0 {
-                ai:ChatCompletionChunkChoice choice = chunk.choices[0];
-                string? fragment = choice.delta.content;
-                if fragment is string {
-                    content += fragment;
-                }
-                ai:ToolCallChunk[]? toolCalls = choice.delta.toolCalls;
-                if toolCalls is ai:ToolCallChunk[] {
-                    foreach ai:ToolCallChunk toolCall in toolCalls {
-                        string? id = toolCall?.id;
-                        if id is string {
-                            toolId = id;
-                        }
-                        ai:FunctionCallChunk? 'function = toolCall?.'function;
-                        if 'function is ai:FunctionCallChunk {
-                            string? name = 'function?.name;
-                            if name is string {
-                                toolName = name;
-                            }
-                            string? args = 'function?.arguments;
-                            if args is string {
-                                toolArgs += args;
-                            }
-                        }
+            chunkCount += 1;
+            // `role` is required on every chunk of the stream, not only the first.
+            test:assertEquals(chunk.role, ai:ASSISTANT);
+
+            string? fragment = chunk.content;
+            if fragment is string {
+                content += fragment;
+            }
+            ai:ToolCallChunk[]? toolCalls = chunk.toolCalls;
+            if toolCalls is ai:ToolCallChunk[] {
+                foreach ai:ToolCallChunk toolCall in toolCalls {
+                    string? id = toolCall?.id;
+                    if id is string {
+                        toolId = id;
+                    }
+                    string? name = toolCall?.name;
+                    if name is string {
+                        toolName = name;
+                    }
+                    string? args = toolCall?.arguments;
+                    if args is string {
+                        toolArgs += args;
                     }
                 }
-                ai:FinishReason? reason = choice.finishReason;
-                if reason is ai:FinishReason {
-                    finishReason = reason;
-                }
             }
-            ai:CompletionTokenUsage? chunkUsage = chunk.usage;
-            if chunkUsage is ai:CompletionTokenUsage {
-                usage = chunkUsage;
+            ai:FinishReason? reason = chunk.finishReason;
+            if reason is ai:FinishReason {
+                finishReason = reason;
             }
         };
 
+    test:assertTrue(chunkCount > 0, "Expected at least one chunk from the stream");
     // Text fragments stream and accumulate.
     test:assertEquals(content, "Hello world");
     // Tool id/name arrive on the first fragment; the JSON argument fragments stream and
@@ -460,17 +459,49 @@ function testChatStream() returns error? {
     test:assertEquals(toolArgs, "{\"city\":\"Paris\"}");
     // Anthropic `tool_use` stop reason normalizes to `tool_calls`.
     test:assertEquals(finishReason, ai:TOOL_CALLS);
-    // Usage merges message_start input tokens with message_delta output tokens.
-    test:assertTrue(usage is ai:CompletionTokenUsage, "Expected usage on the final chunk");
-    ai:CompletionTokenUsage finalUsage = check usage.ensureType();
-    test:assertEquals(finalUsage.promptTokens, 10);
-    test:assertEquals(finalUsage.completionTokens, 7);
-    test:assertEquals(finalUsage.totalTokens, 17);
 }
 
 @test:Config
-function testGenerateStream() returns error? {
-    stream<string, ai:Error?>|ai:Error result = streamProvider->generateStream(`Say hello`);
+function testChatAsStreamTextOnlyWithStopFinishReason() returns error? {
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error result = textOnlyStreamProvider->chatAsStream([
+        {role: ai:USER, content: "Say hello"}
+    ]);
+    test:assertFalse(result is ai:Error, "Expected a stream, got an error");
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check result;
+
+    string content = "";
+    ai:FinishReason? finishReason = ();
+    check from ai:ChatMessageChunk chunk in chunkStream
+        do {
+            test:assertEquals(chunk.role, ai:ASSISTANT);
+            test:assertEquals(chunk.toolCalls, (), "Expected no tool calls in a text-only stream");
+            string? fragment = chunk.content;
+            if fragment is string {
+                content += fragment;
+            }
+            ai:FinishReason? reason = chunk.finishReason;
+            if reason is ai:FinishReason {
+                finishReason = reason;
+            }
+        };
+
+    test:assertEquals(content, "Hello world");
+    // Anthropic `end_turn` stop reason normalizes to `stop`.
+    test:assertEquals(finishReason, ai:STOP);
+}
+
+@test:Config
+function testChatAsStreamConnectionError() returns error? {
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error result = unreachableStreamProvider->chatAsStream([
+        {role: ai:USER, content: "Say hello"}
+    ]);
+    test:assertTrue(result is ai:LlmConnectionError,
+        "Expected an 'ai:LlmConnectionError' when the stream endpoint is unreachable");
+}
+
+@test:Config
+function testGenerateAsStream() returns error? {
+    stream<string, ai:Error?>|ai:Error result = streamProvider->generateAsStream(`Say hello`);
     test:assertFalse(result is ai:Error, "Expected a stream, got an error");
     stream<string, ai:Error?> textStream = check result;
 
@@ -479,18 +510,13 @@ function testGenerateStream() returns error? {
         do {
             collected += fragment;
         };
-    // generateStream projects each chunk's delta.content; tool-call/usage chunks carry no text.
+    // generateAsStream yields only non-empty `content` fragments; tool-call/finish-only
+    // chunks carry no text.
     test:assertEquals(collected, "Hello world");
 }
 
-@test:Config
-function testGenerateStreamRejectsNonStringType() returns error? {
-    stream<int, ai:Error?>|ai:Error result = streamProvider->generateStream(`Say hello`);
-    test:assertTrue(result is ai:Error, "'generateStream' must reject non-string expected types");
-}
-
 // `thinkingConfig` must reach every request path. `generate` builds its payload separately
-// from `chat`/`chatStream`, so it is the one that previously dropped the setting silently.
+// from `chat`/`chatAsStream`, so it is the one that previously dropped the setting silently.
 @test:Config
 function testThinkingConfigAppliesToGenerate() returns error? {
     string _ = check thinkingProvider->generate(`Say hello`);
@@ -512,13 +538,13 @@ function testThinkingConfigAppliesToChat() returns error? {
 }
 
 @test:Config
-function testThinkingConfigAppliesToChatStream() returns error? {
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream =
-        check thinkingStreamProvider->chatStream([{role: ai:USER, content: "Say hello"}]);
+function testThinkingConfigAppliesToChatAsStream() returns error? {
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream =
+        check thinkingStreamProvider->chatAsStream([{role: ai:USER, content: "Say hello"}]);
     check chunkStream.close();
-    map<json> payload = check getCapturedPayload("chatStream").ensureType();
+    map<json> payload = check getCapturedPayload("chatAsStream").ensureType();
     test:assertEquals(payload["thinking"], {'type: "adaptive"},
-            "'chatStream' must send the configured thinking block");
+            "'chatAsStream' must send the configured thinking block");
     test:assertFalse(payload.hasKey("temperature"),
             "'temperature' must be omitted while extended thinking is active");
 }
@@ -526,8 +552,8 @@ function testThinkingConfigAppliesToChatStream() returns error? {
 // Without a thinking config the provider must keep sending `temperature` as before.
 @test:Config
 function testTemperatureSentWhenThinkingIsOff() returns error? {
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream =
-        check streamProvider->chatStream([{role: ai:USER, content: "Say hello"}]);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream =
+        check streamProvider->chatAsStream([{role: ai:USER, content: "Say hello"}]);
     check chunkStream.close();
     map<json> payload = check getCapturedPayload("streamtest").ensureType();
     test:assertFalse(payload.hasKey("thinking"), "No thinking block must be sent when unconfigured");
@@ -569,19 +595,19 @@ function testThinkingRejectedWithDefaultMaxTokens() returns error? {
 }
 
 @test:Config
-function testChatStreamSetsStreamFlag() returns error? {
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream =
-        check streamProvider->chatStream([{role: ai:USER, content: "Say hello"}]);
+function testChatAsStreamSetsStreamFlag() returns error? {
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream =
+        check streamProvider->chatAsStream([{role: ai:USER, content: "Say hello"}]);
     check chunkStream.close();
     map<json> payload = check getCapturedPayload("streamtest").ensureType();
-    test:assertEquals(payload["stream"], true, "'chatStream' must set the stream flag");
+    test:assertEquals(payload["stream"], true, "'chatAsStream' must set the stream flag");
 }
 
 // A generation that fails mid-flight must surface as an error. The transport still reports
 // success, so without this the caller silently receives a truncated answer.
 @test:Config
-function testChatStreamSurfacesMidStreamErrorEvent() returns error? {
-    stream<string, ai:Error?> textStream = check errorEventProvider->generateStream(`Say hello`);
+function testGenerateAsStreamSurfacesMidStreamErrorEvent() returns error? {
+    stream<string, ai:Error?> textStream = check errorEventProvider->generateAsStream(`Say hello`);
     string collected = "";
     error? result = from string fragment in textStream
         do {
@@ -597,8 +623,8 @@ function testChatStreamSurfacesMidStreamErrorEvent() returns error? {
 }
 
 @test:Config
-function testChatStreamSurfacesTruncatedStream() returns error? {
-    stream<string, ai:Error?> textStream = check truncatedProvider->generateStream(`Say hello`);
+function testGenerateAsStreamSurfacesTruncatedStream() returns error? {
+    stream<string, ai:Error?> textStream = check truncatedProvider->generateAsStream(`Say hello`);
     error? result = from string _ in textStream
         do {
         };
@@ -610,8 +636,8 @@ function testChatStreamSurfacesTruncatedStream() returns error? {
 }
 
 @test:Config
-function testChatStreamSurfacesMalformedChunk() returns error? {
-    stream<string, ai:Error?> textStream = check malformedProvider->generateStream(`Say hello`);
+function testGenerateAsStreamSurfacesMalformedChunk() returns error? {
+    stream<string, ai:Error?> textStream = check malformedProvider->generateAsStream(`Say hello`);
     error? result = from string _ in textStream
         do {
         };
@@ -623,37 +649,34 @@ function testChatStreamSurfacesMalformedChunk() returns error? {
 }
 
 // A `cache_creation` object carrying only one of its two TTL buckets used to fail the whole
-// `message_start` conversion, silently dropping every chunk's id/model and the prompt tokens.
+// `message_start` conversion, silently dropping every chunk's id and the prompt tokens.
 @test:Config
-function testChatStreamToleratesPartialUsageFields() returns error? {
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream =
-        check partialUsageProvider->chatStream([{role: ai:USER, content: "hi"}]);
+function testChatAsStreamToleratesPartialUsageFields() returns error? {
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream =
+        check partialUsageProvider->chatAsStream([{role: ai:USER, content: "hi"}]);
 
     string? id = ();
-    string? model = ();
-    ai:CompletionTokenUsage? usage = ();
-    check from ai:ChatCompletionChunk chunk in chunkStream
+    string content = "";
+    ai:FinishReason? finishReason = ();
+    check from ai:ChatMessageChunk chunk in chunkStream
         do {
             string? chunkId = chunk.id;
             if chunkId is string {
                 id = chunkId;
             }
-            string? chunkModel = chunk.model;
-            if chunkModel is string {
-                model = chunkModel;
+            string? fragment = chunk.content;
+            if fragment is string {
+                content += fragment;
             }
-            ai:CompletionTokenUsage? chunkUsage = chunk.usage;
-            if chunkUsage is ai:CompletionTokenUsage {
-                usage = chunkUsage;
+            ai:FinishReason? reason = chunk.finishReason;
+            if reason is ai:FinishReason {
+                finishReason = reason;
             }
         };
 
     test:assertEquals(id, "msg_p", "Message id must survive a partial 'cache_creation'");
-    test:assertEquals(model, "claude-sonnet-4-5", "Model must survive a partial 'cache_creation'");
-    ai:CompletionTokenUsage finalUsage = check usage.ensureType();
-    test:assertEquals(finalUsage.promptTokens, 9);
-    test:assertEquals(finalUsage.completionTokens, 3);
-    test:assertEquals(finalUsage.totalTokens, 12);
+    test:assertEquals(content, "Hi", "Content must still stream despite a partial 'cache_creation'");
+    test:assertEquals(finishReason, ai:STOP);
 }
 
 @test:Config

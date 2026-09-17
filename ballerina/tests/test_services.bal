@@ -121,7 +121,7 @@ service /streamtest on new http:Listener(9090) {
 }
 
 // Captures what each request path sends, so tests can assert that configuration reaches the
-// wire identically across `generate`, `chat`, and `chatStream`.
+// wire identically across `generate`, `chat`, and `chatAsStream`.
 service /configtest on new http:Listener(9093) {
 
     // Non-streaming endpoint shared by `generate` and `chat`.
@@ -147,7 +147,7 @@ service /configtest on new http:Listener(9093) {
     }
 
     resource function post 'stream/messages(map<json> payload, http:Caller caller) returns error? {
-        capturePayload("chatStream", payload);
+        capturePayload("chatAsStream", payload);
         check caller->respond(sseResponse(
             "event: message_start\n" +
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\"," +
@@ -203,7 +203,7 @@ service /streamedge on new http:Listener(9092) {
     }
 
     // A well-formed stream carrying a `cache_creation` object with only one of its two
-    // TTL buckets - the shape that used to wipe out every chunk's id/model/usage.
+    // TTL buckets - the shape that used to wipe out every chunk's id and the prompt tokens.
     resource function post partialusage/messages(map<json> payload, http:Caller caller) returns error? {
         capturePayload("partialusage", payload);
         check caller->respond(sseResponse(
@@ -219,5 +219,36 @@ service /streamedge on new http:Listener(9092) {
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}," +
             "\"usage\":{\"output_tokens\":3}}\n\n" +
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+    }
+}
+
+service /streamtest on new http:Listener(9091) {
+    resource function post anthropic/messages(map<json> payload, http:Caller caller) returns error? {
+        test:assertTrue(payload.hasKey("stream"), "stream flag must be set");
+        test:assertEquals(payload["stream"], true);
+
+        http:Response res = new;
+        res.setHeader("Content-Type", "text/event-stream");
+        // A text-only Anthropic stream: no tool calls, and a natural `end_turn` stop reason
+        // (normalizes to `ai:STOP`) rather than `tool_use`.
+        string sseBody =
+            "event: message_start\n" +
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"type\":\"message\"," +
+            "\"role\":\"assistant\",\"model\":\"claude-3-7-sonnet-20250219\",\"content\":[]," +
+            "\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n" +
+            "event: content_block_start\n" +
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+            "event: content_block_delta\n" +
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n" +
+            "event: content_block_delta\n" +
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n" +
+            "event: content_block_stop\n" +
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+            "event: message_delta\n" +
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n" +
+            "event: message_stop\n" +
+            "data: {\"type\":\"message_stop\"}\n\n";
+        res.setTextPayload(sseBody);
+        check caller->respond(res);
     }
 }

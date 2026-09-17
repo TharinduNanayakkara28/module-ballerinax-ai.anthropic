@@ -444,32 +444,21 @@ type StreamPing record {
     string 'type;
 };
 
-# Maps a single Anthropic streaming SSE event onto a normalized `ai:ChatCompletionChunk`.
+# Maps a single Anthropic streaming SSE event onto a normalized `ai:ChatMessageChunk`.
 #
-# Anthropic's stream is stateful: the message id/model and input-token count arrive once
-# on `message_start`, tool ids/names arrive on `content_block_start`, and the argument
-# fragments arrive on subsequent `content_block_delta` events keyed by the content-block
-# `index`. The caller (the iterator) carries that state and passes it in here. Events that
-# do not produce a chunk (`ping`, `content_block_stop`) yield `()`; malformed payloads
-# yield an `error` so the caller can skip them.
+# Anthropic's stream is stateful: the message id arrives once on `message_start`, tool
+# ids/names arrive on `content_block_start`, and the argument fragments arrive on
+# subsequent `content_block_delta` events keyed by the content-block `index`. The caller
+# (the iterator) carries that id and passes it in here. Events that carry nothing for the
+# caller (`ping`, `content_block_stop`, `message_start`, an unrecognized finish reason) yield
+# `()`; malformed payloads yield an `error` so the caller can fail the stream.
 #
-# + event - The SSE event type (e.g. "message_start", "content_block_delta")
+# + event - The SSE event type (e.g. "content_block_start", "content_block_delta")
 # + data - The raw JSON payload of the event
-# + id - The message id captured from `message_start`
-# + model - The model name captured from `message_start`
-# + inputTokens - The prompt token count captured from `message_start`
+# + id - The message id captured from `message_start`, if known
 # + return - The mapped chunk, `()` for non-emitting events, or an error on a malformed payload
-isolated function toAiChunk(string event, json data, string? id, string? model, int? inputTokens)
-        returns ai:ChatCompletionChunk?|error {
+isolated function toAiChunk(string event, json data, string? id) returns ai:ChatMessageChunk?|error {
     match event {
-        "message_start" => {
-            ai:ChatCompletionChunkDelta delta = {};
-            ai:ROLE? role = mapRole("assistant");
-            if role is ai:ROLE {
-                delta.role = role;
-            }
-            return buildChunk(id, model, [{index: 0, delta}]);
-        }
         "content_block_start" => {
             StreamContentBlockStart blockStart = check data.cloneWithType();
             ContentBlock block = blockStart.content_block;
@@ -481,94 +470,60 @@ isolated function toAiChunk(string event, json data, string? id, string? model, 
             if toolId is string {
                 toolCall.id = toolId;
             }
-            ai:FunctionCallChunk fragment = {};
             string? name = block.name;
             if name is string {
-                fragment.name = name;
+                toolCall.name = name;
             }
-            toolCall.'function = fragment;
-            ai:ChatCompletionChunkDelta delta = {toolCalls: [toolCall]};
-            return buildChunk(id, model, [{index: 0, delta}]);
+            return buildChunk(id, toolCalls = [toolCall]);
         }
         "content_block_delta" => {
             StreamContentBlockDelta blockDelta = check data.cloneWithType();
             StreamDelta streamDelta = blockDelta.delta;
             match streamDelta.'type {
                 "text_delta" => {
-                    ai:ChatCompletionChunkDelta delta = {content: streamDelta.text};
-                    return buildChunk(id, model, [{index: 0, delta}]);
+                    return buildChunk(id, content = streamDelta.text);
                 }
                 "thinking_delta" => {
-                    ai:ChatCompletionChunkDelta delta = {reasoning: streamDelta.thinking};
-                    return buildChunk(id, model, [{index: 0, delta}]);
+                    return buildChunk(id, reasoning = streamDelta.thinking);
                 }
                 "input_json_delta" => {
                     ai:ToolCallChunk toolCall = {
                         index: blockDelta.index,
-                        'function: {arguments: streamDelta.partial_json ?: ""}
+                        arguments: streamDelta.partial_json ?: ""
                     };
-                    ai:ChatCompletionChunkDelta delta = {toolCalls: [toolCall]};
-                    return buildChunk(id, model, [{index: 0, delta}]);
+                    return buildChunk(id, toolCalls = [toolCall]);
                 }
             }
             return ();
         }
         "message_delta" => {
             StreamMessageDelta messageDelta = check data.cloneWithType();
-            ai:ChatCompletionChunkDelta delta = {};
             ai:FinishReason? finishReason = mapFinishReason(messageDelta.delta.stop_reason);
-            ai:ChatCompletionChunk chunk = buildChunk(id, model, [{index: 0, delta, finishReason}]);
-            int outputTokens = messageDelta.usage.output_tokens;
-            ai:CompletionTokenUsage usage = {completionTokens: outputTokens};
-            if inputTokens is int {
-                usage.promptTokens = inputTokens;
-                usage.totalTokens = inputTokens + outputTokens;
+            if finishReason is () {
+                return ();
             }
-            chunk.usage = usage;
-            return chunk;
+            return buildChunk(id, finishReason = finishReason);
         }
     }
     return ();
 }
 
-# Builds an `ai:ChatCompletionChunk`, stamping the carried message id/model when present.
+# Builds an `ai:ChatMessageChunk`, stamping the carried message id when present. `role` is
+# always `ai:ASSISTANT`, as required on every chunk.
 #
 # + id - The message id, if known
-# + model - The model name, if known
-# + choices - The choices for this chunk
+# + content - The answer text fragment, if any
+# + reasoning - The reasoning/thinking fragment, if any
+# + toolCalls - The incremental tool calls, if any
+# + finishReason - The reason the model stopped, if this is the final chunk
 # + return - The assembled chunk
-isolated function buildChunk(string? id, string? model, ai:ChatCompletionChunkChoice[] choices)
-        returns ai:ChatCompletionChunk {
-    ai:ChatCompletionChunk chunk = {choices};
+isolated function buildChunk(string? id, string? content = (), string? reasoning = (),
+        ai:ToolCallChunk[]? toolCalls = (), ai:FinishReason? finishReason = ()) returns ai:ChatMessageChunk {
+    ai:ChatMessageChunk chunk = {role: ai:ASSISTANT, content, reasoning, toolCalls, finishReason};
     if id is string {
         chunk.id = id;
     }
-    if model is string {
-        chunk.model = model;
-    }
     return chunk;
-}
-
-# Safely maps an Anthropic role string onto the `ai:ROLE` enum; returns `()` for absent or
-# unrecognized values rather than panicking on a cast. Streamed deltas only carry the
-# "assistant" role; the others are handled for completeness. ("function" is request-only
-# and its `ai` enum member is not accessible here, so it is intentionally omitted.)
-#
-# + role - The role string
-# + return - The mapped `ai:ROLE`, or `()` when absent/unrecognized
-isolated function mapRole(string? role) returns ai:ROLE? {
-    match role {
-        "system" => {
-            return ai:SYSTEM;
-        }
-        "user" => {
-            return ai:USER;
-        }
-        "assistant" => {
-            return ai:ASSISTANT;
-        }
-    }
-    return ();
 }
 
 # Safely maps an Anthropic `stop_reason` onto the `ai:FinishReason` enum. The `ai` enum is
